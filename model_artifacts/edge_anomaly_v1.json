@@ -1,0 +1,61 @@
+{
+  "model_id": "edge-anomaly-logistic",
+  "version": 1,
+  "trained_at": "2026-08-26T21:28:27.703149+00:00",
+  "training_dataset": "synthetic-enocean-telemetry-v1",
+  "feature_names": [
+    "energy_ratio",
+    "temperature_deviation",
+    "humidity_deviation",
+    "signal_loss",
+    "harvested_energy_deficit",
+    "occupancy_energy_mismatch"
+  ],
+  "normalization": {
+    "energy_ratio": {
+      "mean": 1.15331998,
+      "scale": 0.6642615
+    },
+    "temperature_deviation": {
+      "mean": 0.96703431,
+      "scale": 1.51105762
+    },
+    "humidity_deviation": {
+      "mean": 4.36323529,
+      "scale": 5.57910864
+    },
+    "signal_loss": {
+      "mean": 0.19077819,
+      "scale": 0.29688526
+    },
+    "harvested_energy_deficit": {
+      "mean": 0.01386642,
+      "scale": 0.02941293
+    },
+    "occupancy_energy_mismatch": {
+      "mean": 0.0289277,
+      "scale": 0.08669086
+    }
+  },
+  "weights": {
+    "energy_ratio": 1.90745353,
+    "temperature_deviation": 1.18785702,
+    "humidity_deviation": 1.08625162,
+    "signal_loss": 1.15867595,
+    "harvested_energy_deficit": 1.16433059,
+    "occupancy_energy_mismatch": 0.76241933
+  },
+  "bias": 0.74164591,
+  "threshold": 0.45,
+  "metrics": {
+    "accuracy": 0.9755,
+    "precision": 1.0,
+    "recall": 0.9524,
+    "f1": 0.9756
+  },
+  "runtime": {
+    "python_dependencies": [],
+    "estimated_model_bytes": 1138
+  },
+  "artifact_sha256": "41133d6786861b955d9d316be6872f3731fc37bc5e181cec7633dfa9d2b3f8e2"
+}

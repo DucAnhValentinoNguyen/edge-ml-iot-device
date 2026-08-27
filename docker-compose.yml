@@ -1,0 +1,39 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      network: host
+    image: edgeloop-api
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      DATABASE_PATH: /app/data/edge.db
+      MODEL_ARTIFACT_PATH: /app/model_artifacts/edge_anomaly_v1.json
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3003,http://127.0.0.1:3003}
+    volumes:
+      - edge_data:/app/data
+      - ./model_artifacts:/app/model_artifacts
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 10s
+      timeout: 4s
+      retries: 10
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: edgeloop-dashboard
+    ports:
+      - "${FRONTEND_PORT:-3003}:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  edge_data:
