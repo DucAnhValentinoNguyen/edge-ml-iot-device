@@ -13,6 +13,11 @@ type Model = {
   deployment_target: string;
 };
 
+type ModelCatalog = {
+  production: Model;
+  candidate: Model | null;
+};
+
 type Device = {
   id: string;
   name: string;
@@ -62,6 +67,20 @@ type Overview = {
   model: Model;
 };
 
+type ModelOperations = {
+  data_quality: { score: number; readings: number; low_signal_readings: number; reviewed_labels: number; status: string };
+  drift: { score: number; threshold: number; status: string; features: { name: string; baseline: number; current: number; psi: number }[] };
+  retraining: {
+    status: string;
+    candidate_version: number;
+    training_window: string;
+    candidate_metrics: { precision: number; recall: number; f1: number };
+    candidate_artifact_sha256?: string | null;
+    trained_at?: string | null;
+  };
+  deployment: { production_version: number; rollout: string; rollback_available: boolean };
+};
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${API}${path}`, options);
   if (!response.ok) {
@@ -76,10 +95,11 @@ function formatAge(value: string) {
   return minutes < 1 ? "just now" : `${minutes}m ago`;
 }
 
-function Sparkline({ readings }: { readings: Reading[] }) {
+function Sparkline({ readings, maxValue }: { readings: Reading[]; maxValue: number }) {
   const points = readings.map((reading, index) => {
     const x = readings.length === 1 ? 50 : (index / (readings.length - 1)) * 100;
-    const y = 90 - Math.min(72, reading.energy_usage * 30);
+    const normalized = maxValue <= 0 ? 0 : reading.energy_usage / maxValue;
+    const y = 90 - Math.min(78, normalized * 78);
     return `${x},${y}`;
   });
   return (
@@ -103,13 +123,29 @@ export default function Home() {
   const [fault, setFault] = useState<"energy_spike" | "comfort_drift" | "device_health">("energy_spike");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [operations, setOperations] = useState<ModelOperations | null>(null);
+  const [models, setModels] = useState<ModelCatalog | null>(null);
+  const [retraining, setRetraining] = useState(false);
   const selected = overview?.devices.find((device) => device.id === selectedId) || overview?.devices[0];
+  const latestReading = readings.at(-1);
+  const activeModel =
+    selected?.model_version && models?.candidate && selected.model_version === models.candidate.version
+      ? models.candidate
+      : models?.production || overview?.model;
+  const chartMax = Math.max(0.8, ...readings.map((reading) => reading.energy_usage));
+  const chartTicks = [chartMax, chartMax * 0.67, chartMax * 0.33, 0];
+  const deployVersion =
+    operations?.retraining.status === "candidate_ready"
+      ? operations.retraining.candidate_version
+      : activeModel?.version;
 
   async function refresh(nextDeviceId?: string) {
     try {
       setError("");
       const next = await request<Overview>("/v1/overview");
       setOverview(next);
+      setOperations(await request<ModelOperations>("/v1/model-operations"));
+      setModels(await request<ModelCatalog>("/v1/models/current"));
       const preferredDeviceId = nextDeviceId || selectedId;
       const deviceId = next.devices.some((device) => device.id === preferredDeviceId)
         ? preferredDeviceId
@@ -148,16 +184,33 @@ export default function Home() {
   }
 
   async function deploy() {
-    if (!selected) return;
+    if (!selected || !deployVersion) return;
     try {
       setBusy(true);
       setError("");
-      await request(`/v1/devices/${selected.id}/deploy`, { method: "POST" });
+      await request(`/v1/devices/${selected.id}/deploy`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ version: deployVersion }),
+      });
       await refresh(selected.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Deployment failed.");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function retrain() {
+    try {
+      setRetraining(true);
+      setError("");
+      await request("/v1/models/retrain", { method: "POST" });
+      await refresh(selected?.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Retraining failed.");
+    } finally {
+      setRetraining(false);
     }
   }
 
@@ -169,28 +222,21 @@ export default function Home() {
 
   return (
     <main className="app-shell">
-      <nav className="topbar">
-        <div className="brand"><span className="brand-mark">&#9676;</span><span>EDGELOOP</span><small>DEVICE INTELLIGENCE</small></div>
-        <div className="nav-status"><span className="status-dot" /> FLEET ONLINE <span className="nav-divider" /> v0.4.0</div>
-      </nav>
-
-      <section className="hero">
-        <div className="hero-copy">
-          <p className="kicker">DEVICE INTELLIGENCE / EDGE DEPLOYMENT LAB</p>
-          <h1>Decisions that happen<br /><em>where the data lives.</em></h1>
-          <p className="hero-description">A compact anomaly model runs inside every sensor gateway. The cloud receives verified decisions, not a firehose of raw telemetry.</p>
-          <div className="hero-actions">
-            <select value={fault} onChange={(event) => setFault(event.target.value as typeof fault)} aria-label="Simulation fault">
-              <option value="energy_spike">Inject energy spike</option>
-              <option value="comfort_drift">Inject comfort drift</option>
-              <option value="device_health">Inject device health fault</option>
-            </select>
-            <button className="primary-button" disabled={busy || !selected} onClick={() => void runSimulation()}>{busy ? "Running..." : "Run device simulation"}<span>-&gt;</span></button>
-          </div>
-          {error && <p className="error-banner" role="alert">{error}</p>}
+      <section className="control-strip">
+        <div className="control-copy">
+          <p className="section-label">LIVE DASHBOARD</p>
+          <h1>Edge device operations</h1>
         </div>
-        <div className="hero-orbit" aria-hidden="true"><div className="orbit orbit-a" /><div className="orbit orbit-b" /><div className="orbit-core"><span>ML</span><small>ON EDGE</small></div><div className="orbit-node node-a" /><div className="orbit-node node-b" /></div>
+        <div className="control-actions">
+          <select value={fault} onChange={(event) => setFault(event.target.value as typeof fault)} aria-label="Simulation fault">
+            <option value="energy_spike">Inject energy spike</option>
+            <option value="comfort_drift">Inject comfort drift</option>
+            <option value="device_health">Inject device health fault</option>
+          </select>
+          <button className="primary-button" disabled={busy || !selected} onClick={() => void runSimulation()}>{busy ? "Running..." : "Run simulation"}<span>-&gt;</span></button>
+        </div>
       </section>
+      {error && <p className="error-banner inline-error" role="alert">{error}</p>}
 
       <section className="metrics-grid" aria-label="Fleet metrics">
         <article className="metric-card accent-cyan"><span>ACTIVE NODES</span><strong>{overview?.online_devices ?? "--"}</strong><small>of {overview?.devices.length ?? "--"} provisioned</small></article>
@@ -214,19 +260,19 @@ export default function Home() {
         </aside>
 
         <section className="panel detail-panel">
-          <div className="panel-heading detail-heading"><div><p className="section-label">02 / DEVICE TELEMETRY</p><h2>{selected?.name || "Loading device..."}</h2></div><button className="quiet-button" disabled={busy || !selected} onClick={() => void deploy()}>Deploy v{overview?.model.version ?? "-"} <span>v</span></button></div>
+          <div className="panel-heading detail-heading"><div><p className="section-label">02 / DEVICE TELEMETRY</p><h2>{selected?.name || "Loading device..."}</h2></div><button className="quiet-button" disabled={busy || !selected} onClick={() => void deploy()}>Deploy v{deployVersion ?? "-"} <span>v</span></button></div>
           {selected ? <>
             <div className="device-meta"><span><b>MODEL</b> {selected.model_id} / v{selected.model_version}</span><span><b>FIRMWARE</b> {selected.firmware_version}</span><span><b>LAST SEEN</b> {formatAge(selected.last_seen)}</span></div>
-            <div className="chart-wrap"><div className="chart-header"><div><span>ENERGY USAGE</span><strong>{readings.at(-1)?.energy_usage.toFixed(2) || "--"} <small>kWh</small></strong></div><span className="chart-legend"><i className="legend-line" /> live edge stream</span></div><div className="chart-grid"><span>2.4</span><span>1.6</span><span>0.8</span><span>0.0</span><Sparkline readings={readings} /></div><div className="chart-axis"><span>36 samples ago</span><span>now</span></div></div>
-            <div className="sensor-strip"><div><span className="sensor-label">TEMP</span><strong>{readings.at(-1)?.temperature.toFixed(1) || "--"} deg</strong></div><div><span className="sensor-label">HUMIDITY</span><strong>{readings.at(-1)?.humidity.toFixed(0) || "--"}%</strong></div><div><span className="sensor-label">SIGNAL</span><strong>{Math.round((selected.signal_quality || 0) * 100)}%</strong></div><div><span className="sensor-label">HARVEST</span><strong>{readings.at(-1)?.harvested_energy.toFixed(2) || "--"}<small>mJ</small></strong></div></div>
+            <div className="chart-wrap"><div className="chart-header"><div><span>ENERGY USAGE</span><strong>{latestReading?.energy_usage.toFixed(2) || "--"} <small>kWh</small></strong></div><span className="chart-legend"><i className="legend-line" /> live edge stream</span></div><div className="chart-grid">{chartTicks.map((tick, index) => <span key={`${tick}-${index}`}>{tick.toFixed(1)}</span>)}<Sparkline readings={readings} maxValue={chartMax} /></div><div className="chart-axis"><span>{readings.length || 0} samples ago</span><span>now</span></div></div>
+            <div className="sensor-strip"><div><span className="sensor-label">TEMP</span><strong>{latestReading?.temperature.toFixed(1) || "--"} deg</strong></div><div><span className="sensor-label">HUMIDITY</span><strong>{latestReading?.humidity.toFixed(0) || "--"}%</strong></div><div><span className="sensor-label">SIGNAL</span><strong>{latestReading ? `${Math.round(latestReading.signal_quality * 100)}%` : "--"}</strong></div><div><span className="sensor-label">HARVEST</span><strong>{latestReading?.harvested_energy.toFixed(2) || "--"}<small>mJ</small></strong></div></div>
           </> : <div className="empty-state">Connect the API to inspect a deployed device.</div>}
         </section>
 
         <aside className="panel model-panel">
           <div className="panel-heading"><div><p className="section-label">03 / MODEL CARD</p><h2>Edge artifact</h2></div><span className="verified">&#10003; VERIFIED</span></div>
-          <div className="model-name"><span className="model-chip">LOGISTIC</span><strong>{overview?.model.model_id || "edge-anomaly-logistic"}</strong><small>v{overview?.model.version ?? "-"} / 6 features / no dependencies</small></div>
-          <div className="model-metrics"><div><span>F1 SCORE</span><strong>{overview ? `${(overview.model.metrics.f1 * 100).toFixed(0)}%` : "--"}</strong></div><div><span>THRESHOLD</span><strong>{overview ? overview.model.threshold : "--"}</strong></div></div>
-          <div className="hash-block"><span>ARTIFACT CHECKSUM</span><code>{overview?.model.artifact_sha256 ? `${overview.model.artifact_sha256.slice(0, 20)}...` : "loading..."}</code></div>
+          <div className="model-name"><span className="model-chip">LOGISTIC</span><strong>{activeModel?.model_id || "edge-anomaly-logistic"}</strong><small>v{activeModel?.version ?? "-"} / 6 features / no dependencies</small></div>
+          <div className="model-metrics"><div><span>F1 SCORE</span><strong>{activeModel ? `${(activeModel.metrics.f1 * 100).toFixed(0)}%` : "--"}</strong></div><div><span>THRESHOLD</span><strong>{activeModel ? activeModel.threshold : "--"}</strong></div></div>
+          <div className="hash-block"><span>ARTIFACT CHECKSUM</span><code>{activeModel?.artifact_sha256 ? `${activeModel.artifact_sha256.slice(0, 20)}...` : "loading..."}</code></div>
           <p className="model-note">The same normalized weights run in Python for training, C for firmware, and the device simulator for this demo.</p>
         </aside>
       </section>
@@ -237,6 +283,29 @@ export default function Home() {
           {latest.map((reading) => <article className="alert-row" key={reading.id}><span className="alert-severity">!</span><div className="alert-main"><strong>{reading.inference.anomaly_type.replaceAll("_", " ")}</strong><span>{reading.inference.explanation}</span></div><div className="alert-device"><strong>{reading.device_id}</strong><span>{new Date(reading.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span></div><span className="probability">{Math.round(reading.inference.probability * 100)}%</span></article>)}
           {!latest.length && <div className="empty-state">No anomalies yet. Run a device simulation to create one.</div>}
         </div>
+      </section>
+
+      <section className="ops-grid" aria-label="Model operations">
+        <section className="panel ops-panel">
+          <div className="panel-heading"><div><p className="section-label">05 / MODEL OPERATIONS</p><h2>Trust signals</h2></div><span className={`ops-status ${operations?.drift.status === "action_required" ? "warn" : "ok"}`}>{operations?.drift.status.replaceAll("_", " ") || "loading"}</span></div>
+          <div className="ops-cards">
+            <div className="ops-card"><span>DATA QUALITY</span><strong>{operations ? `${Math.round(operations.data_quality.score * 100)}%` : "--"}</strong><small>{operations?.data_quality.low_signal_readings ?? "--"} low-signal readings</small></div>
+            <div className="ops-card"><span>DRIFT SCORE</span><strong>{operations ? operations.drift.score.toFixed(2) : "--"}</strong><small>threshold {operations?.drift.threshold.toFixed(2) || "--"}</small></div>
+            <div className="ops-card"><span>REVIEWED LABELS</span><strong>{operations?.data_quality.reviewed_labels ?? "--"}</strong><small>operator feedback</small></div>
+          </div>
+          <div className="feature-drift">
+            {(operations?.drift.features || []).map((feature) => <div className="drift-row" key={feature.name}><span>{feature.name.replaceAll("_", " ")}</span><div className="drift-bar"><i style={{ width: `${Math.min(100, feature.psi * 100)}%` }} /></div><code>{feature.psi.toFixed(2)} PSI</code></div>)}
+          </div>
+        </section>
+        <section className="panel lifecycle-panel">
+          <div className="panel-heading"><div><p className="section-label">06 / LIFECYCLE</p><h2>Retrain safely</h2></div><span className="lifecycle-dot" /></div>
+          <div className="lifecycle-step"><span>01</span><div><strong>Production</strong><small>v{operations?.deployment.production_version ?? "--"} / {operations?.deployment.rollout || "loading"}</small></div><b>LIVE</b></div>
+          <div className="lifecycle-line" />
+          <div className="lifecycle-step candidate"><span>02</span><div><strong>Candidate</strong><small>v{operations?.retraining.candidate_version ?? "--"} / {operations?.retraining.training_window || "waiting"}</small></div><b>{operations?.retraining.status.replaceAll("_", " ") || "--"}</b></div>
+          <button className="retrain-button" disabled={retraining} onClick={() => void retrain()}>{retraining ? "Training candidate..." : "Train candidate model"}<span>-&gt;</span></button>
+          <p className="lifecycle-note">Candidate F1 {operations ? (operations.retraining.candidate_metrics.f1 * 100).toFixed(0) : "--"}% / precision {operations ? (operations.retraining.candidate_metrics.precision * 100).toFixed(0) : "--"}% / recall {operations ? (operations.retraining.candidate_metrics.recall * 100).toFixed(0) : "--"}%.</p>
+          <p className="lifecycle-note">A candidate never replaces production automatically. Evaluate it offline, approve a canary rollout, then keep rollback available.</p>
+        </section>
       </section>
       <footer><span>EDGELOOP LAB / SYNTHETIC TELEMETRY</span><span>MODEL-FIRST. DEVICE-BOUND. OBSERVABLE.</span></footer>
     </main>

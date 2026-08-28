@@ -50,6 +50,7 @@ the API accepts it only once.
 - Idempotent telemetry ingestion and model deployment audit events.
 - Operator-facing explanations and recommended investigation steps.
 - Dashboard for model verification, live telemetry, and alert simulation.
+- Model operations view for data quality, feature drift, candidate retraining, and safe rollout review.
 - Gateway adapter with learn-in, demo profile decoding, deduplication, and health APIs.
 - API tests, runtime tests, frontend typecheck/build, and Gitleaks CI.
 
@@ -85,6 +86,8 @@ hardware.
 | `GET /v1/devices/{id}/telemetry` | Inspect a device's recent samples |
 | `GET /v1/anomalies` | Query explainable edge alerts |
 | `POST /v1/models/train` | Retrain and reload the local artifact |
+| `GET /v1/model-operations` | Inspect quality, drift, deployment, and retraining status |
+| `POST /v1/models/retrain` | Create an isolated candidate artifact for review |
 | `POST /v1/gateways/{id}/learn-in` | Discover an unknown device and suggest a profile |
 | `POST /v1/onboarding/register` | Register a device profile and friendly location |
 | `POST /v1/gateways/{id}/telegrams` | Decode a raw gateway telegram and run edge inference |

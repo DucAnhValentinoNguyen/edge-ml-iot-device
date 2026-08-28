@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+
+from edge_runtime.features import extract_features
 
 
 def utc_now() -> str:
@@ -370,21 +373,223 @@ class TelemetryStore:
         self.connection.commit()
         return self.get_reading(reading_id) if cursor.rowcount else None
 
+    def training_readings(self, limit: int = 600) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM readings ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [self._reading(row) for row in reversed(rows)]
+
     def overview(self) -> dict[str, Any]:
         total = self.connection.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
         anomalies = self.connection.execute(
             "SELECT COUNT(*) FROM readings WHERE json_extract(inference_json, '$.is_anomaly') = 1"
         ).fetchone()[0]
         devices = self.list_devices()
+        readings = self.training_readings(limit=min(400, max(40, total)))
         return {
             "total_readings": total,
             "anomalies": anomalies,
             "edge_decisions": total,
-            "bandwidth_saved_pct": 96.4,
+            "bandwidth_saved_pct": round(self._bandwidth_saved_pct(readings), 1),
             "online_devices": sum(1 for device in devices if device["online"]),
             "devices": devices,
             "latest_anomalies": self.list_anomalies(limit=6),
         }
+
+    def model_operations(
+        self,
+        model_version: int,
+        candidate_artifact: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Return explainable quality and drift signals for the operations view."""
+        telemetry = self.training_readings(limit=600)
+        total = len(telemetry)
+        missing = sum(1 for reading in telemetry if float(reading["signal_quality"]) < 0.55)
+        reviewed = self.connection.execute(
+            "SELECT COUNT(*) FROM readings WHERE feedback_label IS NOT NULL"
+        ).fetchone()[0]
+        anomalies = sum(
+            1 for reading in telemetry if bool((reading.get("inference") or {}).get("is_anomaly"))
+        )
+        quality = max(0.0, 1.0 - (missing / max(1, total)))
+        baseline_window, current_window = self._split_windows(telemetry)
+        feature_rows = self._feature_drift(baseline_window, current_window)
+        mean_psi = (
+            sum(feature["psi"] for feature in feature_rows) / len(feature_rows)
+            if feature_rows
+            else 0.0
+        )
+        anomaly_rate = anomalies / max(1, len(current_window) or total)
+        drift_score = min(0.99, mean_psi + anomaly_rate * 0.35 + (1.0 - quality) * 0.2)
+        candidate_status = "candidate_ready" if candidate_artifact else (
+            "retrain_recommended" if drift_score >= 0.25 and total >= 60 else "monitoring"
+        )
+        candidate_metrics = (
+            dict(candidate_artifact.get("metrics", {}))
+            if candidate_artifact
+            else {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+        )
+        return {
+            "data_quality": {
+                "score": round(quality, 3),
+                "readings": total,
+                "low_signal_readings": missing,
+                "reviewed_labels": reviewed,
+                "status": "healthy" if quality >= 0.95 else "watch",
+            },
+            "drift": {
+                "score": round(drift_score, 3),
+                "threshold": 0.25,
+                "status": "action_required" if drift_score >= 0.25 else "stable",
+                "features": feature_rows,
+            },
+            "retraining": {
+                "status": candidate_status,
+                "candidate_version": int(candidate_artifact["version"]) if candidate_artifact else model_version + 1,
+                "training_window": (
+                    f"{len(current_window)} recent readings vs {len(baseline_window)} baseline readings"
+                    if current_window and baseline_window
+                    else "waiting for more telemetry"
+                ),
+                "candidate_metrics": candidate_metrics,
+                "candidate_artifact_sha256": candidate_artifact.get("artifact_sha256") if candidate_artifact else None,
+                "trained_at": candidate_artifact.get("trained_at") if candidate_artifact else None,
+            },
+            "deployment": {
+                "production_version": model_version,
+                "rollout": "100% production",
+                "rollback_available": True,
+            },
+        }
+
+    @staticmethod
+    def _split_windows(readings: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if len(readings) < 12:
+            return readings, readings
+        current_size = min(72, max(12, len(readings) // 3))
+        baseline = readings[:-current_size]
+        current = readings[-current_size:]
+        if len(baseline) < 12:
+            midpoint = len(readings) // 2
+            return readings[:midpoint], readings[midpoint:]
+        return baseline, current
+
+    def _feature_drift(
+        self,
+        baseline_window: list[dict[str, Any]],
+        current_window: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        feature_map = {
+            "energy_usage": lambda reading: float(reading["energy_usage"]),
+            "temperature": lambda reading: float(reading["temperature"]),
+            "signal_quality": lambda reading: float(reading["signal_quality"]),
+        }
+        rows: list[dict[str, Any]] = []
+        for name, getter in feature_map.items():
+            baseline_values = [getter(reading) for reading in baseline_window]
+            current_values = [getter(reading) for reading in current_window]
+            rows.append(
+                {
+                    "name": name,
+                    "baseline": round(self._mean(baseline_values), 3),
+                    "current": round(self._mean(current_values), 3),
+                    "psi": round(self._population_stability_index(baseline_values, current_values), 3),
+                }
+            )
+        feature_baseline = [extract_features(reading) for reading in baseline_window]
+        feature_current = [extract_features(reading) for reading in current_window]
+        if feature_baseline and feature_current:
+            rows.append(
+                {
+                    "name": "energy_ratio",
+                    "baseline": round(self._mean([row["energy_ratio"] for row in feature_baseline]), 3),
+                    "current": round(self._mean([row["energy_ratio"] for row in feature_current]), 3),
+                    "psi": round(
+                        self._population_stability_index(
+                            [row["energy_ratio"] for row in feature_baseline],
+                            [row["energy_ratio"] for row in feature_current],
+                        ),
+                        3,
+                    ),
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _mean(values: Iterable[float]) -> float:
+        items = list(values)
+        return sum(items) / len(items) if items else 0.0
+
+    @staticmethod
+    def _population_stability_index(
+        baseline_values: list[float],
+        current_values: list[float],
+        buckets: int = 5,
+    ) -> float:
+        if not baseline_values or not current_values:
+            return 0.0
+        lower = min(min(baseline_values), min(current_values))
+        upper = max(max(baseline_values), max(current_values))
+        if math.isclose(lower, upper):
+            return 0.0
+        width = (upper - lower) / buckets
+        psi = 0.0
+        epsilon = 1e-6
+        for index in range(buckets):
+            start = lower + width * index
+            end = upper if index == buckets - 1 else start + width
+            if index == buckets - 1:
+                baseline_count = sum(1 for value in baseline_values if start <= value <= end)
+                current_count = sum(1 for value in current_values if start <= value <= end)
+            else:
+                baseline_count = sum(1 for value in baseline_values if start <= value < end)
+                current_count = sum(1 for value in current_values if start <= value < end)
+            baseline_share = max(epsilon, baseline_count / len(baseline_values))
+            current_share = max(epsilon, current_count / len(current_values))
+            psi += (current_share - baseline_share) * math.log(current_share / baseline_share)
+        return max(0.0, psi)
+
+    @staticmethod
+    def _bandwidth_saved_pct(readings: list[dict[str, Any]]) -> float:
+        if not readings:
+            return 0.0
+        raw_bytes = 0
+        anomaly_bytes = 0
+        anomalies = 0
+        for reading in readings:
+            inference = reading.get("inference") or {}
+            raw_payload = {
+                "temperature": reading["temperature"],
+                "humidity": reading["humidity"],
+                "occupancy": reading["occupancy"],
+                "energy_usage": reading["energy_usage"],
+                "signal_quality": reading["signal_quality"],
+                "harvested_energy": reading["harvested_energy"],
+                "timestamp": reading["timestamp"],
+            }
+            raw_bytes += len(json.dumps(raw_payload, separators=(",", ":")).encode("utf-8"))
+            if inference.get("is_anomaly"):
+                anomalies += 1
+                anomaly_payload = {
+                    "timestamp": reading["timestamp"],
+                    "device_id": reading["device_id"],
+                    "probability": inference.get("probability", 0.0),
+                    "anomaly_type": inference.get("anomaly_type", "none"),
+                    "model_version": inference.get("model_version"),
+                }
+                anomaly_bytes += len(
+                    json.dumps(anomaly_payload, separators=(",", ":")).encode("utf-8")
+                )
+        heartbeat_payload = {
+            "device_id": readings[-1]["device_id"],
+            "status": "healthy",
+            "model_version": (readings[-1].get("inference") or {}).get("model_version"),
+        }
+        heartbeat_bytes = len(json.dumps(heartbeat_payload, separators=(",", ":")).encode("utf-8"))
+        heartbeat_count = max(1, math.ceil(len(readings) / 12))
+        edge_bytes = anomaly_bytes + heartbeat_count * heartbeat_bytes
+        return max(0.0, min(99.9, (1.0 - (edge_bytes / max(1, raw_bytes))) * 100.0))
 
     @staticmethod
     def _device(row: sqlite3.Row) -> dict[str, Any]:

@@ -10,6 +10,9 @@ class Settings:
     model_artifact_path: str = os.getenv(
         "MODEL_ARTIFACT_PATH", "model_artifacts/edge_anomaly_v1.json"
     )
+    candidate_artifact_path: str = os.getenv(
+        "CANDIDATE_MODEL_ARTIFACT_PATH", "model_artifacts/edge_anomaly_candidate_v2.json"
+    )
     cors_origins: tuple[str, ...] = tuple(
         origin.strip()
         for origin in os.getenv(
@@ -17,4 +20,3 @@ class Settings:
         ).split(",")
         if origin.strip()
     )
-

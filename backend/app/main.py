@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -25,13 +26,59 @@ from .schemas import (
 from .storage import TelemetryStore
 
 settings = Settings()
-artifact = ModelArtifact.load(settings.model_artifact_path)
-runtime = EdgeRuntime(artifact)
 store = TelemetryStore(settings.database_path)
 gateway = GatewayAdapter()
+production_artifact: ModelArtifact
+candidate_artifact: ModelArtifact | None
+runtimes: dict[int, EdgeRuntime]
+
+
+def _candidate_metadata() -> dict[str, Any] | None:
+    path = Path(settings.candidate_artifact_path)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _reload_artifacts() -> None:
+    global production_artifact, candidate_artifact, runtimes
+    production_artifact = ModelArtifact.load(settings.model_artifact_path)
+    candidate_path = Path(settings.candidate_artifact_path)
+    candidate_artifact = (
+        ModelArtifact.load(candidate_path) if candidate_path.exists() else None
+    )
+    runtimes = {production_artifact.version: EdgeRuntime(production_artifact)}
+    if candidate_artifact:
+        runtimes[candidate_artifact.version] = EdgeRuntime(candidate_artifact)
+
+
+def _artifact_for_version(version: int | None) -> ModelArtifact:
+    if version is None or version == production_artifact.version:
+        return production_artifact
+    if candidate_artifact and version == candidate_artifact.version:
+        return candidate_artifact
+    raise HTTPException(status_code=404, detail=f"Model version {version} is not available")
+
+
+def _artifact_for_device(device_id: str) -> ModelArtifact:
+    deployment = store.get_deployment(device_id)
+    deployed_version = int(deployment["model_version"]) if deployment else None
+    if deployed_version is None:
+        return production_artifact
+    try:
+        return _artifact_for_version(deployed_version)
+    except HTTPException:
+        return production_artifact
+
+
+def _runtime_for_device(device_id: str) -> EdgeRuntime:
+    active = _artifact_for_device(device_id)
+    return runtimes[active.version]
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    _reload_artifacts()
     _seed_demo_data()
     yield
 
@@ -62,8 +109,8 @@ def _seed_demo_data() -> None:
     for device_id, name, building, room, fault in demo_devices:
         store.ensure_device(
             device_id,
-            artifact.model_id,
-            artifact.version,
+            production_artifact.model_id,
+            production_artifact.version,
             name=name,
             building=building,
             room=room,
@@ -71,9 +118,14 @@ def _seed_demo_data() -> None:
         for step in range(24):
             reading = generate_reading(device_id, step, fault=fault, start=start)
             reading["event_id"] = f"seed:{device_id}:{step}"
-            prediction = runtime.predict(reading)
+            prediction = _runtime_for_device(device_id).predict(reading)
             store.record_telemetry(reading, prediction.to_dict())
-        store.deploy(device_id, artifact.model_id, artifact.version, artifact.artifact_sha256)
+        store.deploy(
+            device_id,
+            production_artifact.model_id,
+            production_artifact.version,
+            production_artifact.artifact_sha256,
+        )
 
 
 @app.get("/")
@@ -86,9 +138,10 @@ def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "model_loaded": True,
-        "model_id": artifact.model_id,
-        "model_version": artifact.version,
-        "artifact_sha256": artifact.artifact_sha256,
+        "model_id": production_artifact.model_id,
+        "model_version": production_artifact.version,
+        "artifact_sha256": production_artifact.artifact_sha256,
+        "candidate_version": candidate_artifact.version if candidate_artifact else None,
     }
 
 
@@ -151,7 +204,7 @@ def ingest_telegram(gateway_id: str, payload: TelegramPayload) -> dict[str, Any]
     if accepted and result.known_device and not result.duplicate:
         reading = _decoded_reading(result_dict, telegram.source_eurid)
         if reading:
-            prediction = runtime.predict(reading)
+            prediction = _runtime_for_device(str(reading["device_id"])).predict(reading)
             telemetry_recorded, _ = store.record_telemetry(reading, prediction.to_dict())
     return {
         "accepted": accepted,
@@ -200,16 +253,27 @@ def register_device(payload: RegisterDevicePayload) -> dict[str, Any]:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     device_id = payload.device_id or f"node-{source.lower()}"
     store.upsert_onboarding(
-        source, payload.gateway_id, payload.profile_id, payload.friendly_id,
-        payload.location, "operable", device_id,
+        source,
+        payload.gateway_id,
+        payload.profile_id,
+        payload.friendly_id,
+        payload.location,
+        "operable",
+        device_id,
     )
-    store.ensure_device(device_id, artifact.model_id, artifact.version, name=payload.friendly_id, room=payload.location)
+    store.ensure_device(
+        device_id,
+        production_artifact.model_id,
+        production_artifact.version,
+        name=payload.friendly_id,
+        room=payload.location,
+    )
     return {**registered, "device_id": device_id}
 
 
 @app.get("/v1/overview")
 def overview() -> dict[str, Any]:
-    return {**store.overview(), "model": model_response()}
+    return {**store.overview(), "model": model_response(production_artifact)}
 
 
 @app.get("/v1/devices")
@@ -222,7 +286,14 @@ def get_device(device_id: str) -> dict[str, Any]:
     device = store.get_device(device_id)
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    return {**device, "deployment": store.get_deployment(device_id)}
+    return {
+        **device,
+        "deployment": store.get_deployment(device_id),
+        "available_versions": [
+            production_artifact.version,
+            *([candidate_artifact.version] if candidate_artifact else []),
+        ],
+    }
 
 
 @app.get("/v1/devices/{device_id}/telemetry")
@@ -235,7 +306,9 @@ def device_telemetry(
 
 
 @app.get("/v1/devices/{device_id}/events")
-def device_events(device_id: str, limit: int = Query(default=40, ge=1, le=200)) -> list[dict[str, Any]]:
+def device_events(
+    device_id: str, limit: int = Query(default=40, ge=1, le=200)
+) -> list[dict[str, Any]]:
     if not store.get_device(device_id):
         raise HTTPException(status_code=404, detail="Device not found")
     return store.list_events(device_id, limit)
@@ -244,11 +317,15 @@ def device_events(device_id: str, limit: int = Query(default=40, ge=1, le=200)) 
 @app.post("/v1/devices/{device_id}/deploy")
 def deploy_model(device_id: str, payload: DeployPayload | None = None) -> dict[str, Any]:
     requested = payload or DeployPayload()
-    if requested.model_id and requested.model_id != artifact.model_id:
+    target = _artifact_for_version(requested.version)
+    if requested.model_id and requested.model_id != target.model_id:
         raise HTTPException(status_code=409, detail="Requested model is not available")
-    if requested.version and requested.version != artifact.version:
-        raise HTTPException(status_code=409, detail="Requested model version is not available")
-    return store.deploy(device_id, artifact.model_id, artifact.version, artifact.artifact_sha256)
+    return store.deploy(
+        device_id,
+        target.model_id,
+        target.version,
+        target.artifact_sha256,
+    )
 
 
 @app.get("/v1/devices/{device_id}/deployment")
@@ -261,10 +338,14 @@ def device_deployment(device_id: str) -> dict[str, Any]:
 
 @app.post("/v1/telemetry")
 def ingest_telemetry(payload: TelemetryPayload) -> dict[str, Any]:
-    global runtime
     reading = payload.model_dump(mode="json", exclude={"inference"})
-    server_prediction = runtime.predict(reading)
-    edge_prediction = payload.inference.model_dump(mode="json") if payload.inference else server_prediction.to_dict()
+    active_artifact = _artifact_for_device(payload.device_id)
+    server_prediction = _runtime_for_device(payload.device_id).predict(reading)
+    edge_prediction = (
+        payload.inference.model_dump(mode="json")
+        if payload.inference
+        else server_prediction.to_dict()
+    )
     accepted, reading_id = store.record_telemetry(reading, edge_prediction)
     return {
         "accepted": accepted,
@@ -272,10 +353,10 @@ def ingest_telemetry(payload: TelemetryPayload) -> dict[str, Any]:
         "edge_inference": edge_prediction,
         "server_verification": {
             "verified": (
-                edge_prediction.get("artifact_sha256") == artifact.artifact_sha256
+                edge_prediction.get("artifact_sha256") == active_artifact.artifact_sha256
                 and abs(float(edge_prediction["probability"]) - server_prediction.probability) < 0.08
             ),
-            "artifact_verified": edge_prediction.get("artifact_sha256") == artifact.artifact_sha256,
+            "artifact_verified": edge_prediction.get("artifact_sha256") == active_artifact.artifact_sha256,
             "model_id": server_prediction.model_id,
             "model_version": server_prediction.model_version,
         },
@@ -305,14 +386,14 @@ def anomaly_feedback(reading_id: str, payload: FeedbackPayload) -> dict[str, Any
     return item
 
 
-def model_response() -> dict[str, Any]:
+def model_response(active_artifact: ModelArtifact) -> dict[str, Any]:
     return {
-        "model_id": artifact.model_id,
-        "version": artifact.version,
-        "artifact_sha256": artifact.artifact_sha256,
-        "feature_names": list(artifact.feature_names),
-        "threshold": artifact.threshold,
-        "metrics": dict(artifact.metrics),
+        "model_id": active_artifact.model_id,
+        "version": active_artifact.version,
+        "artifact_sha256": active_artifact.artifact_sha256,
+        "feature_names": list(active_artifact.feature_names),
+        "threshold": active_artifact.threshold,
+        "metrics": dict(active_artifact.metrics),
         "runtime_dependencies": [],
         "deployment_target": "Python / C-compatible edge runtime",
     }
@@ -320,27 +401,74 @@ def model_response() -> dict[str, Any]:
 
 @app.get("/v1/models/current")
 def current_model() -> dict[str, Any]:
-    return model_response()
+    metadata = _candidate_metadata()
+    return {
+        "production": model_response(production_artifact),
+        "candidate": {**model_response(candidate_artifact), "trained_at": metadata.get("trained_at")} if candidate_artifact and metadata else None,
+    }
+
+
+@app.get("/v1/model-operations")
+def model_operations() -> dict[str, Any]:
+    metadata = _candidate_metadata()
+    return store.model_operations(
+        production_artifact.version,
+        candidate_artifact=metadata,
+    )
 
 
 @app.post("/v1/models/train")
 def train_model() -> dict[str, Any]:
-    global artifact, runtime
     destination = Path(settings.model_artifact_path)
-    save_artifact(destination, firmware_path=Path("firmware/edge_model.h"))
-    artifact = ModelArtifact.load(destination)
-    runtime = EdgeRuntime(artifact)
-    return model_response()
+    save_artifact(
+        destination,
+        version=production_artifact.version,
+        firmware_path=Path("firmware/edge_model.h"),
+        telemetry_readings=store.training_readings(limit=700),
+    )
+    _reload_artifacts()
+    return model_response(production_artifact)
+
+
+@app.post("/v1/models/retrain")
+def retrain_model() -> dict[str, Any]:
+    destination = Path(settings.candidate_artifact_path)
+    training_rows = store.training_readings(limit=700)
+    save_artifact(
+        destination,
+        seed=47,
+        version=production_artifact.version + 1,
+        telemetry_readings=training_rows,
+    )
+    _reload_artifacts()
+    metadata = _candidate_metadata() or {}
+    candidate = _artifact_for_version(production_artifact.version + 1)
+    return {
+        "job_id": f"retrain-{uuid.uuid4().hex[:10]}",
+        "status": "candidate_ready",
+        "candidate": {
+            "model_id": candidate.model_id,
+            "version": candidate.version,
+            "artifact_sha256": candidate.artifact_sha256,
+            "metrics": dict(candidate.metrics),
+            "trained_at": metadata.get("trained_at"),
+            "training_samples": len(training_rows),
+            "approval_required": True,
+        },
+        "production": model_response(production_artifact),
+    }
 
 
 @app.post("/v1/simulations")
 def run_simulation(payload: SimulationPayload) -> dict[str, Any]:
     simulation_id = f"sim-{uuid.uuid4().hex[:10]}"
     start = datetime.now(timezone.utc) - timedelta(minutes=payload.steps - 1)
+    fault_window = (max(0, payload.steps - 8), payload.steps - 1)
     anomalies_found = 0
     accepted = 0
     last_prediction: dict[str, Any] | None = None
-    store.ensure_device(payload.device_id, artifact.model_id, artifact.version)
+    active_artifact = _artifact_for_device(payload.device_id)
+    store.ensure_device(payload.device_id, active_artifact.model_id, active_artifact.version)
     for step in range(payload.steps):
         reading = generate_reading(
             payload.device_id,
@@ -348,9 +476,10 @@ def run_simulation(payload: SimulationPayload) -> dict[str, Any]:
             fault=payload.fault,
             seed=41,
             start=start,
+            fault_window=fault_window,
         )
         reading["event_id"] = f"{simulation_id}:{step}"
-        prediction = runtime.predict(reading)
+        prediction = _runtime_for_device(payload.device_id).predict(reading)
         inserted, _ = store.record_telemetry(reading, prediction.to_dict())
         accepted += int(inserted)
         anomalies_found += int(prediction.is_anomaly)
@@ -361,6 +490,6 @@ def run_simulation(payload: SimulationPayload) -> dict[str, Any]:
         "fault": payload.fault,
         "readings_ingested": accepted,
         "anomalies_detected": anomalies_found,
-        "model": model_response(),
+        "model": model_response(_artifact_for_device(payload.device_id)),
         "last_edge_decision": last_prediction,
     }

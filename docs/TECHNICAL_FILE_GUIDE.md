@@ -78,7 +78,7 @@ This guide describes the responsibility of each committed file in the
 | `frontend/next-env.d.ts` | Next.js generated type definitions required by TypeScript. |
 | `frontend/Dockerfile` | Builds the frontend container image and starts the Next.js development server inside Docker. |
 | `frontend/app/layout.tsx` | Root layout and metadata for the dashboard app. |
-| `frontend/app/page.tsx` | Main fleet dashboard UI, including overview loading, device selection, simulation triggering, deployment actions, telemetry charts, and alert display. |
+| `frontend/app/page.tsx` | Main fleet dashboard UI, including overview loading, device selection, simulation triggering, deployment actions, telemetry charts, alert display, and model-operations lifecycle panels. |
 | `frontend/app/globals.css` | Global visual system, layout rules, typography, responsive behavior, and component styling for the dashboard. |
 
 ## Model artifacts

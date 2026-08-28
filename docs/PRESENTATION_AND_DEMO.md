@@ -17,19 +17,23 @@ visibility, model governance, and operator workflows."
 "The operator does not need to inspect thousands of normal readings. The edge
 runtime turns telemetry into a compact decision: normal or anomalous, a
 probability, the likely anomaly type, the contributing signals, and a suggested
-next action. The dashboard shows the model version, checksum, device health,
-recent telemetry, and alerts. This makes the result actionable and auditable,
-not just a black-box score."
+next action. The dashboard only shows the operational surface that matters:
+fleet status, recent telemetry, active alerts, model provenance, drift signals,
+and retraining readiness. This makes the result actionable and auditable, not
+just a black-box score."
 
 ### 2:00-3:00 - Architecture
 
-"The stack has four layers. First, a device and gateway layer accepts raw
-wireless-style telegrams. Second, a dependency-light Python edge runtime
-normalizes features and executes the model. Third, a FastAPI service persists
-telemetry, deployments, alerts, and gateway onboarding data in SQLite for a
-self-contained demo. Fourth, a Next.js and TypeScript dashboard provides fleet
-operations. Everything is packaged with Docker Compose, and GitHub Actions runs
-the quality checks."
+"The stack has five layers. First, a simulated sensor or telegram source emits
+temperature, humidity, occupancy, energy, signal, and harvested-energy data.
+Second, a gateway adapter handles learn-in, profile decoding, deduplication,
+and raw-packet validation. Third, a dependency-light Python edge runtime
+normalizes the six model features and executes the anomaly model locally.
+Fourth, a FastAPI backend persists telemetry, deployments, alerts, gateway
+state, onboarding records, and model-operation signals in SQLite for a
+self-contained demo. Fifth, a Next.js and TypeScript dashboard provides the
+operator experience. Docker Compose runs the full stack locally, and GitHub
+Actions covers tests, builds, and secret scanning."
 
 ### 3:00-4:00 - Data and protocol boundary
 
@@ -47,37 +51,49 @@ does not need to know how the radio packet was transported."
 synthetic building telemetry. Training produces a versioned JSON artifact with
 feature names, threshold, metrics, and a SHA-256 checksum. The same normalized
 weights are exported as C constants for firmware. At startup, the service
-verifies and loads the artifact. A deployment records the model ID, version,
-checksum, and time, so an operator can answer which model made a decision."
+verifies and loads the production artifact. The operations view then calculates
+data-quality signals, drift indicators, and candidate retraining readiness from
+accepted telemetry. A deployment records the model ID, version, checksum, and
+time, so an operator can answer which model made a decision and whether a new
+candidate should be reviewed before rollout."
 
 ### 5:00-6:00 - Reliability and safety
 
 "The design treats edge inference as a product boundary. Input validation
 rejects impossible values. Event IDs make telemetry idempotent. Duplicate radio
 repetitions are tracked and removed within a configurable time window. The
-dashboard surfaces signal quality, harvested energy, last-seen time, and model
-health. The demo uses SQLite to stay portable, but the interfaces are ready to
-move to PostgreSQL, object storage, MQTT, and a signed artifact registry."
+backend can compare an edge-supplied decision envelope with a server-side
+verification pass, so the cloud can confirm that the reported model checksum
+matches the expected production artifact. The demo uses SQLite to stay
+portable, but the interfaces are ready to move to PostgreSQL, object storage,
+MQTT, signed artifact registries, and staged rollout workflows."
 
 ### 6:00-7:00 - Customer value
 
 "For a building operator, this means earlier detection of abnormal energy use,
-comfort drift, or failing devices. For a platform owner, it means less data
-movement, lower cloud cost, faster local decisions, and graceful behavior when
-the network is unreliable. For engineering and compliance teams, it provides
-reproducibility, model provenance, explicit validation, and a clear separation
+comfort drift, or failing devices without waiting for a round trip to the
+cloud. For a platform owner, it means less data movement, lower cloud cost,
+faster local decisions, and graceful behavior when the network is unreliable.
+For engineering and compliance teams, it provides reproducibility, model
+provenance, explicit validation, drift visibility, and a clear separation
 between untrusted device input and trusted server-side records."
 
 ### 7:00-9:00 - Live demo
 
-"I will first show the fleet view and the current model card. I will inject an
-energy spike and show that the alert appears with an explanation. Then I will
-open the API documentation and simulate a new gateway telegram. The gateway
-first reports an unknown device and suggests a profile. I register that device,
-send the same packet again, and show that it is decoded into temperature and
-humidity and passed into the edge inference path. Finally, I will send the same
-packet within the deduplication window and show that the repeated transmission
-is not counted as a second telemetry reading."
+"I will start directly in the dashboard because it now opens straight into the
+operational surface. First I will show the fleet metrics, a selected device,
+its local telemetry trend, and the deployed model card.
+
+Next I will inject an
+energy spike and show a new alert with probability and explanation. Then I will
+move to the model-operations area and explain drift, reviewed labels, and
+candidate retraining. After that, I will open the API documentation and
+simulate a new gateway telegram. The gateway first reports an unknown device
+and suggests a profile. I register that device, send the same packet again, and
+show that it is decoded into normalized values and passed into the edge
+inference path. Finally, I send the same packet within the deduplication window
+and show that the repeated transmission is not counted as a second telemetry
+reading."
 
 ### 9:00-10:00 - Close
 
@@ -106,13 +122,32 @@ Open:
 The API seeds two devices and a historical alert, so the dashboard is useful
 immediately.
 
+### What the dashboard means
+
+Use this explanation while the dashboard is on screen:
+
+1. The device or gateway produces telemetry locally.
+2. The edge runtime scores the reading on-device or at the gateway boundary.
+3. The backend stores the reading, decision, deployment metadata, and alert history.
+4. The dashboard is the operator layer. It does not run the model itself; it shows the inputs, the decision outcome, model provenance, and fleet health.
+
 ### Show the model and local decision
 
-1. Point out the model card, artifact checksum, feature count, threshold, and F1 score.
-2. Select `Inject energy spike`.
-3. Click `Run device simulation`.
-4. Show the new alert, probability, explanation, energy chart, and recommended action in the API response if needed.
-5. Click `Deploy v1` and point out the deployment event and unchanged checksum.
+1. Point out the compact simulation strip at the top and explain it is your fault-injection control for the demo.
+2. Point out the metrics row, selected device, telemetry chart, and model card.
+3. Explain that the model card proves the same artifact contract exists across Python training, backend verification, and C firmware export.
+4. Select `Inject energy spike`.
+5. Click `Run simulation`.
+6. Show the new alert, probability, explanation, and device chart movement.
+7. Click `Deploy v1` and point out the deployment event and unchanged checksum.
+
+### Show drift monitoring and candidate retraining
+
+1. Move to `MODEL OPERATIONS` and explain that drift is derived from accepted live telemetry, not a random placeholder.
+2. Point out data quality, low-signal readings, reviewed labels, and the drift feature bars.
+3. Move to `LIFECYCLE` and explain the separation between production and candidate models.
+4. Click `Train candidate model`.
+5. Explain that the action creates a reviewable candidate artifact and does not silently replace the production model.
 
 ### Show gateway learn-in and decoding
 
@@ -124,7 +159,7 @@ python scripts/simulate_gateway.py --learn-in --steps 3
 
 Explain the sequence:
 
-1. The raw payload arrives with a source device ID, radio profile, bytes, RSSI, and timestamp.
+1. The raw payload arrives with a gateway ID, source device ID, radio profile, payload bytes, RSSI, and timestamp.
 2. Learn-in returns candidate profiles without silently trusting an unknown device.
 3. Registration assigns a friendly name and location.
 4. The next telegram is decoded into key-value data and routed to the edge model.
@@ -137,14 +172,22 @@ GET  /v1/profiles
 GET  /v1/gateways
 GET  /v1/gateways/{gateway_id}/health
 GET  /v1/onboarding
+GET  /v1/model-operations
+POST /v1/models/retrain
 ```
+
+### Optional technical proof points if they ask
+
+1. Open `firmware/edge_model.h` and explain that the trained artifact is exported as C constants for embedded integration.
+2. Open `/v1/models/current` or `/healthz` and show model version plus checksum.
+3. Open `/v1/devices/{device_id}/telemetry` and show that stored readings already include the inference envelope.
 
 ### Do not spend demo time on
 
-- Retraining the model live unless someone asks about the lifecycle.
-- The C firmware compilation details; show the generated header briefly and explain the contract.
-- Database internals or the full source tree.
-- Production cloud deployment, since this release intentionally runs locally.
+1. Database internals or the full source tree.
+2. Full training math unless the audience explicitly wants the ML details.
+3. Production cloud deployment, since this release intentionally runs locally.
+4. Claiming that the demo laptop is a certified edge device; position it as a production-shaped reference implementation.
 
 ### Honest positioning
 

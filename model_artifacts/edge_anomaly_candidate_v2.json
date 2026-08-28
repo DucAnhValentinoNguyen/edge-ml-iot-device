@@ -1,0 +1,75 @@
+{
+  "model_id": "edge-anomaly-logistic",
+  "version": 2,
+  "trained_at": "2026-08-28T08:08:34.964903+00:00",
+  "training_dataset": "telemetry-adapted-training",
+  "training_summary": {
+    "source": "telemetry-adapted-training",
+    "telemetry_samples": 700,
+    "synthetic_samples": 875,
+    "profile": {
+      "occupied_energy": 1.1887,
+      "unoccupied_energy": 0.2632,
+      "occupied_temperature": 20.8909,
+      "unoccupied_temperature": 19.3856,
+      "humidity": 46.2847,
+      "signal_quality": 0.9549,
+      "harvested_energy": 0.1835
+    }
+  },
+  "feature_names": [
+    "energy_ratio",
+    "temperature_deviation",
+    "humidity_deviation",
+    "signal_loss",
+    "harvested_energy_deficit",
+    "occupancy_energy_mismatch"
+  ],
+  "normalization": {
+    "energy_ratio": {
+      "mean": 1.15079245,
+      "scale": 0.48346262
+    },
+    "temperature_deviation": {
+      "mean": 0.84998254,
+      "scale": 1.28943864
+    },
+    "humidity_deviation": {
+      "mean": 4.02220873,
+      "scale": 5.28042229
+    },
+    "signal_loss": {
+      "mean": 0.15691905,
+      "scale": 0.26937391
+    },
+    "harvested_energy_deficit": {
+      "mean": 0.01134921,
+      "scale": 0.02780654
+    },
+    "occupancy_energy_mismatch": {
+      "mean": 0.00463571,
+      "scale": 0.03078886
+    }
+  },
+  "weights": {
+    "energy_ratio": 2.63163601,
+    "temperature_deviation": 1.44954705,
+    "humidity_deviation": 0.95947622,
+    "signal_loss": 1.26280015,
+    "harvested_energy_deficit": 1.21911917,
+    "occupancy_energy_mismatch": 0.19653144
+  },
+  "bias": 0.33847904,
+  "threshold": 0.45,
+  "metrics": {
+    "accuracy": 0.9873,
+    "precision": 0.994,
+    "recall": 0.9822,
+    "f1": 0.9881
+  },
+  "runtime": {
+    "python_dependencies": [],
+    "estimated_model_bytes": 1442
+  },
+  "artifact_sha256": "2d736192b84d0f5232304d511d57d075a305428256991c74ee2cd9cac212ff7f"
+}
